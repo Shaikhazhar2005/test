@@ -1,0 +1,147 @@
+# Builds a source-build tarball
+
+parameters:
+  # Custom condition to apply to the job
+  condition: true
+
+  # Dependent jobs that must be completed before this job will run
+  dependsOn:
+
+  # The resource id of the tarball to download and build
+  tarballResourceId: current
+
+  # The following parameters aren't expected to be passed in rather they are used for encapsulation
+  # -----------------------------------------------------------------------------------------------
+  centOS7Container: mcr.microsoft.com/dotnet-buildtools/prereqs:centos-7-source-build-20210714125450-5d87b80
+  centOS8Container: mcr.microsoft.com/dotnet-buildtools/prereqs:centos-8-source-build-20211118190102-9355e7b
+  debian9Container: mcr.microsoft.com/dotnet-buildtools/prereqs:debian-stretch-20211001171226-047508b
+  fedora33Container: mcr.microsoft.com/dotnet-buildtools/prereqs:fedora-33-20210222183538-031e7d2
+  ubuntu1804Container: mcr.microsoft.com/dotnet-buildtools/prereqs:ubuntu-18.04-20210924170306-047508b
+  poolInternal:
+    name: NetCore1ESPool-Svc-Internal
+    demands: ImageOverride -equals Build.Ubuntu.1804.Amd64
+  poolPublic:
+    name: NetCore1ESPool-Svc-Public
+    demands: ImageOverride -equals Build.Ubuntu.1804.Amd64.Open
+  tarballDir: $(Build.StagingDirectory)/tarball
+
+jobs:
+- job: Build_Tarball
+  condition: ${{ parameters.condition }}
+  displayName: Build Tarball
+  dependsOn: ${{ parameters.dependsOn }}
+  pool:
+    ${{ if eq(variables['System.TeamProject'], 'public') }}:
+      name: NetCore1ESPool-Public
+      demands: ImageOverride -equals Build.Ubuntu.1804.Amd64.Open
+    ${{ if eq(variables['System.TeamProject'], 'internal') }}:
+      name: NetCore1ESPool-Internal
+      demands: ImageOverride -equals Build.Ubuntu.1804.Amd64
+  strategy:
+    matrix:
+      CentOS7-Online:
+        _BootstrapPrep: true
+        _BuildArch: x64
+        _Container: ${{ parameters.centOS7Container }}
+        _ExcludeOmniSharpTests: true
+        _RunOnline: true
+      ${{ if ne(variables['Build.Reason'], 'PullRequest') }}:
+        CentOS7-Offline:
+          _BootstrapPrep: true
+          _BuildArch: x64
+          _Container: ${{ parameters.centOS7Container }}
+          _ExcludeOmniSharpTests: true
+          _RunOnline: false
+        CentOS8-Offline:
+          _BootstrapPrep: true
+          _BuildArch: x64
+          _Container: ${{ parameters.centOS8Container }}
+          _ExcludeOmniSharpTests: false
+          _RunOnline: false
+        Fedora33-Offline:
+          _BootstrapPrep: false
+          _BuildArch: x64
+          _Container: ${{ parameters.fedora33Container }}
+          _ExcludeOmniSharpTests: false
+          _RunOnline: false
+        Ubuntu1804-Offline:
+          _BootstrapPrep: true
+          _BuildArch: x64
+          _Container: ${{ parameters.ubuntu1804Container }}
+          _ExcludeOmniSharpTests: false
+          _RunOnline: false
+  timeoutInMinutes: 300
+  workspace:
+    clean: all
+
+  steps:
+  - checkout: none
+
+  - template: /src/SourceBuild/Arcade/eng/common/templates/steps/source-build-build-tarball.yml
+    parameters:
+      buildArch: $(_BuildArch)
+      container: $(_Container)
+      excludeOmniSharpTests: $(_ExcludeOmniSharpTests)
+      prepScript: |
+        set -x
+
+        customPrepArgs=
+        if [ '$(_BootstrapPrep)' = 'true' ]; then
+          customPrepArgs='--bootstrap'
+        fi
+
+        docker run --rm -v ${{ parameters.tarballDir }}:/tarball -w /tarball $(_Container) ./prep.sh  ${customPrepArgs}
+      runOnline: $(_RunOnline)
+      tarballDir: ${{ parameters.tarballDir }}
+      tarballResourceId: ${{ parameters.tarballResourceId }}
+
+- ${{ if ne(variables['Build.Reason'], 'PullRequest') }}:
+  - job: Rebuild_Tarball
+    displayName: Rebuild Tarball With Previous
+    dependsOn: Build_Tarball
+    pool:
+      ${{ if eq(variables['System.TeamProject'], 'public') }}:
+        ${{ parameters.poolPublic }}
+      ${{ if eq(variables['System.TeamProject'], 'internal') }}:
+        ${{ parameters.poolInternal }}
+    strategy:
+      matrix:
+        Fedora33-Offline:
+          _PreviousSourceBuildArtifact: Build Tarball Fedora33-Offline_Artifacts
+          _BuildArch: x64
+          _Container: ${{ parameters.fedora33Container }}
+          _RunOnline: false
+    timeoutInMinutes: 180
+    workspace:
+      clean: all
+
+    steps:
+    - checkout: none
+
+    - download: current
+      artifact: $(_PreviousSourceBuildArtifact)
+      patterns: '*.tar.gz'
+      displayName: Download Previous Source Build Artifacts
+
+    - task: CopyFiles@2
+      displayName: Copy Previous Source Build Artifacts
+      inputs:
+        SourceFolder: $(PIPELINE.WORKSPACE)/$(_PreviousSourceBuildArtifact)
+        Contents: '*.tar.gz'
+        TargetFolder: ${{ parameters.tarballDir }}/packages/archive/
+
+    - template: /src/SourceBuild/Arcade/eng/common/templates/steps/source-build-build-tarball.yml
+      parameters:
+        additionalBuildArgs: --with-sdk /tarball/.dotnet
+        buildArch: $(_BuildArch)
+        container: $(_Container)
+        prepScript: |
+          set -x
+
+          mkdir ${{ parameters.tarballDir }}/.dotnet
+          tarballFilePath="${{ parameters.tarballDir }}/packages/archive/dotnet-sdk-*.tar.gz"
+          eval tar -ozxf "$tarballFilePath" -C "${{ parameters.tarballDir }}/.dotnet"
+          eval rm -f "$tarballFilePath"
+        runOnline: $(_RunOnline)
+        tarballDir: ${{ parameters.tarballDir }}
+        tarballResourceId: ${{ parameters.tarballResourceId }}
